@@ -645,12 +645,20 @@ class LiteLLMBackend(Backend):
                 tool_use_blocks = []
                 tool_result_blocks = []
 
+                # Track cache_control on the last text block to preserve prompt
+                # caching. Claude Code marks the last user text block with
+                # cache_control: {type: ephemeral}; passing it through lets LiteLLM's
+                # Bedrock Converse transformer emit a cachePoint after that block.
+                last_text_cache_control: dict | None = None
                 for block in content:
                     if not isinstance(block, dict):
                         continue
                     block_type = block.get("type", "")
                     if block_type == "text":
                         text_parts.append(block.get("text", ""))
+                        # Track cache_control from text blocks (last one wins)
+                        if "cache_control" in block:
+                            last_text_cache_control = block["cache_control"]
                     elif block_type == "tool_use":
                         tool_use_blocks.append(block)
                     elif block_type == "tool_result":
@@ -669,13 +677,18 @@ class LiteLLMBackend(Backend):
                             tr_content = "\n".join(
                                 b.get("text", "") for b in tr_content if b.get("type") == "text"
                             )
-                        converted.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tr["tool_use_id"],
-                                "content": str(tr_content),
-                            }
-                        )
+                        tool_msg: dict[str, Any] = {
+                            "role": "tool",
+                            "tool_call_id": tr["tool_use_id"],
+                            "content": str(tr_content),
+                        }
+                        # Claude Code's tail-history cache breakpoint usually sits on a
+                        # tool_result block, not the system prompt. Carry cache_control
+                        # through so LiteLLM's Bedrock Converse transformer emits a
+                        # cachePoint here too.
+                        if "cache_control" in tr:
+                            tool_msg["cache_control"] = tr["cache_control"]
+                        converted.append(tool_msg)
                     continue
 
                 # tool_use blocks → OpenAI assistant message with tool_calls
@@ -699,9 +712,13 @@ class LiteLLMBackend(Backend):
                     converted.append(assistant_msg)
                     continue
 
-                # Simple text only
+                # Simple text only -- preserve cache_control if present so LiteLLM's
+                # Bedrock Converse transformer can emit a cachePoint after the text block.
                 if text_parts:
-                    converted.append({"role": role, "content": "\n".join(text_parts)})
+                    msg: dict[str, Any] = {"role": role, "content": "\n".join(text_parts)}
+                    if last_text_cache_control is not None:
+                        msg["cache_control"] = last_text_cache_control
+                    converted.append(msg)
                 else:
                     converted.append({"role": role, "content": ""})
 
@@ -800,11 +817,11 @@ class LiteLLMBackend(Backend):
                 if isinstance(system, str):
                     kwargs["messages"].insert(0, {"role": "system", "content": system})
                 elif isinstance(system, list):
-                    # Anthropic list format
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
-                    )
-                    kwargs["messages"].insert(0, {"role": "system", "content": system_text})
+                    # Pass the Anthropic list format through as-is instead of collapsing
+                    # it to a plain string. Collapsing strips any cache_control markers
+                    # Claude Code attaches to system blocks, which silently disables
+                    # Bedrock Converse prompt caching (cachePoint) on the system prompt.
+                    kwargs["messages"].insert(0, {"role": "system", "content": system})
 
             # Provider-specific region config
             if self.region:
@@ -908,10 +925,9 @@ class LiteLLMBackend(Backend):
                 if isinstance(system, str):
                     kwargs["messages"].insert(0, {"role": "system", "content": system})
                 elif isinstance(system, list):
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
-                    )
-                    kwargs["messages"].insert(0, {"role": "system", "content": system_text})
+                    # Pass the Anthropic list format through as-is; see send_message
+                    # for why collapsing to a plain string disables prompt caching.
+                    kwargs["messages"].insert(0, {"role": "system", "content": system})
 
             # Provider-specific region config
             if self.region:
@@ -933,6 +949,12 @@ class LiteLLMBackend(Backend):
                     kwargs["api_key"] = auth_header[7:]
                 elif headers.get("x-api-key"):
                     kwargs["api_key"] = headers["x-api-key"]
+
+            # Request usage in the final streaming chunk so cache metrics
+            # (cache_read_input_tokens / cache_creation_input_tokens) come back
+            # to the caller. Without this, LiteLLM/Bedrock never emits a usage
+            # chunk over SSE and cache stats always read 0.
+            kwargs["stream_options"] = {"include_usage": True}
 
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -961,8 +983,22 @@ class LiteLLMBackend(Backend):
             active_block_type: str | None = None  # "text" or "tool_use"
             tool_block_map: dict[int, int] = {}  # litellm tc.index → SSE block index
             stop_reason = "end_turn"
+            # Populated from the final usage chunk (stream_options.include_usage=True
+            # set above). Bedrock cache stats otherwise always read 0 on the streaming
+            # path, since the running deltas never carry usage.
+            final_input_tokens = 0
+            final_cache_read_tokens = 0
+            final_cache_write_tokens = 0
 
             async for chunk in response:
+                if hasattr(chunk, "usage") and chunk.usage:
+                    cu = chunk.usage
+                    final_input_tokens = int(getattr(cu, "prompt_tokens", 0) or 0)
+                    final_cache_read_tokens = int(getattr(cu, "cache_read_input_tokens", 0) or 0)
+                    final_cache_write_tokens = int(
+                        getattr(cu, "cache_creation_input_tokens", 0) or 0
+                    )
+
                 if not hasattr(chunk, "choices") or not chunk.choices:
                     continue
 
