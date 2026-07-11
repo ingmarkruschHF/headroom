@@ -222,6 +222,37 @@ def _reject_task_lifecycle(manifest: DeploymentManifest, action: str) -> None:
     is_flag=True,
     help="Disable HTTP/2 in the persistent runtime (enabled by default).",
 )
+@click.option(
+    "--code-aware/--no-code-aware",
+    "code_aware",
+    default=None,
+    help=(
+        "Enable/disable AST-based code compression in the persistent runtime. "
+        "Requires the optional tree-sitter dependency: pip install headroom-ai[code]. "
+        "Default: disabled, matching `headroom proxy`."
+    ),
+)
+@click.option(
+    "--intercept-tool-results",
+    is_flag=True,
+    help=(
+        "Opt in to tool_result interceptors (ast-grep Read outliner, etc.) in the "
+        "persistent runtime. Off by default while this feature ships."
+    ),
+)
+@click.option(
+    "--protect-tool-results",
+    default=None,
+    help=(
+        "Comma-separated tool names whose results are never lossy-compressed in "
+        "the persistent runtime, merged with the built-in defaults (e.g. Bash,WebFetch)."
+    ),
+)
+@click.option(
+    "--bedrock-profile",
+    default=None,
+    help="AWS profile name for Bedrock in the persistent runtime (default: use default credentials).",
+)
 def install_apply(
     preset: str,
     runtime: str,
@@ -239,6 +270,10 @@ def install_apply(
     no_telemetry: bool,
     image: str,
     no_http2: bool,
+    code_aware: bool | None,
+    intercept_tool_results: bool,
+    protect_tool_results: str | None,
+    bedrock_profile: str | None,
 ) -> None:
     """Install a persistent Headroom deployment."""
 
@@ -267,6 +302,10 @@ def install_apply(
         telemetry_enabled=telemetry and not no_telemetry,
         image=image,
         no_http2=no_http2,
+        code_aware=code_aware,
+        intercept_tool_results=intercept_tool_results,
+        protect_tool_results=protect_tool_results,
+        bedrock_profile=bedrock_profile,
     )
 
     try:
