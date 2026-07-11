@@ -211,3 +211,19 @@ def test_build_manifest_persists_bedrock_profile() -> None:
 
     idx = manifest.proxy_args.index("--bedrock-profile")
     assert manifest.proxy_args[idx + 1] == "sso-bedrock"
+
+
+def test_build_manifest_merges_extra_env_into_base_env() -> None:
+    manifest = build_manifest(
+        **_base_manifest_kwargs(extra_env={"HEADROOM_WORKSPACE_DIR": "/custom/workspace"})
+    )
+
+    assert manifest.base_env["HEADROOM_WORKSPACE_DIR"] == "/custom/workspace"
+
+
+def test_build_manifest_extra_env_overrides_derived_defaults() -> None:
+    manifest = build_manifest(**_base_manifest_kwargs(extra_env={"HEADROOM_TELEMETRY": "on"}))
+
+    # telemetry_enabled=False in _base_manifest_kwargs would normally set "off";
+    # an explicit --env must win.
+    assert manifest.base_env["HEADROOM_TELEMETRY"] == "on"

@@ -253,6 +253,19 @@ def _reject_task_lifecycle(manifest: DeploymentManifest, action: str) -> None:
     default=None,
     help="AWS profile name for Bedrock in the persistent runtime (default: use default credentials).",
 )
+@click.option(
+    "--env",
+    "extra_env",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help=(
+        "Extra environment variable for the supervised process, e.g. "
+        "--env HEADROOM_WORKSPACE_DIR=/path. Supervisors (launchd, systemd, cron) "
+        "start with a bare environment and do not inherit the interactive shell's "
+        "exports, so anything the runtime needs beyond the flags above must be set "
+        "here. Repeatable."
+    ),
+)
 def install_apply(
     preset: str,
     runtime: str,
@@ -274,6 +287,7 @@ def install_apply(
     intercept_tool_results: bool,
     protect_tool_results: str | None,
     bedrock_profile: str | None,
+    extra_env: tuple[str, ...],
 ) -> None:
     """Install a persistent Headroom deployment."""
 
@@ -285,6 +299,13 @@ def install_apply(
 
     if preset == InstallPreset.PERSISTENT_DOCKER.value:
         runtime = RuntimeKind.DOCKER.value
+
+    parsed_env: dict[str, str] = {}
+    for item in extra_env:
+        if "=" not in item:
+            raise click.ClickException(f"--env expects KEY=VALUE, got: {item!r}")
+        key, _, value = item.partition("=")
+        parsed_env[key] = value
 
     manifest = build_manifest(
         profile=profile,
@@ -306,6 +327,7 @@ def install_apply(
         intercept_tool_results=intercept_tool_results,
         protect_tool_results=protect_tool_results,
         bedrock_profile=bedrock_profile,
+        extra_env=parsed_env,
     )
 
     try:

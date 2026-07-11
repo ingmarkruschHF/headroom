@@ -23,6 +23,7 @@ from .paths import (
     windows_run_cmd_path,
     windows_run_script_path,
 )
+from .providers import _powershell_literal
 from .runtime import resolve_headroom_command
 
 # After `launchctl bootout`, a follow-up `bootstrap` of the same label can
@@ -44,10 +45,21 @@ def _command_for_script(*parts: str) -> list[str]:
     return [*resolve_headroom_command(), *parts]
 
 
-def _render_unix_runner(path: Path, command: list[str]) -> ArtifactRecord:
+def _render_unix_runner(
+    path: Path, command: list[str], env: dict[str, str] | None = None
+) -> ArtifactRecord:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Supervisors (launchd, systemd, cron) invoke this script with a bare
+    # environment — they do not inherit the interactive shell's exports (e.g.
+    # AWS_PROFILE, a custom HEADROOM_WORKSPACE_DIR). Export base_env here, before
+    # the exec, so `headroom install agent run` itself (which loads the manifest
+    # from HEADROOM_WORKSPACE_DIR) sees the same environment `install apply` was
+    # run under, not just the proxy subprocess it spawns.
+    export_lines = "".join(f"export {name}={shlex.quote(value)}\n" for name, value in (env or {}).items())
     path.write_text(
-        "#!/usr/bin/env bash\nset -euo pipefail\nexec "
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        + export_lines
+        + "exec "
         + " ".join(shlex.quote(x) for x in command)
         + "\n"
     )
@@ -56,13 +68,20 @@ def _render_unix_runner(path: Path, command: list[str]) -> ArtifactRecord:
 
 
 def _render_windows_runner(
-    ps1_path: Path, cmd_path: Path, command: list[str]
+    ps1_path: Path, cmd_path: Path, command: list[str], env: dict[str, str] | None = None
 ) -> list[ArtifactRecord]:
     ps1_path.parent.mkdir(parents=True, exist_ok=True)
     escaped = " ".join(
         [f'"{item}"' if (" " in item or item.endswith(".cmd")) else item for item in command]
     )
-    ps1_path.write_text(f"$ErrorActionPreference = 'Stop'\n& {escaped}\nexit $LASTEXITCODE\n")
+    # See _render_unix_runner: Windows services/tasks also start with a bare
+    # environment, so base_env must be set explicitly before invoking headroom.
+    env_lines = "".join(
+        f"$env:{name} = {_powershell_literal(value)}\n" for name, value in (env or {}).items()
+    )
+    ps1_path.write_text(
+        f"$ErrorActionPreference = 'Stop'\n{env_lines}& {escaped}\nexit $LASTEXITCODE\n"
+    )
     cmd_path.write_text(
         '@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0'
         + ps1_path.name
@@ -84,6 +103,7 @@ def render_runner_scripts(manifest: DeploymentManifest) -> list[ArtifactRecord]:
                 windows_run_script_path(manifest.profile),
                 windows_run_cmd_path(manifest.profile),
                 _command_for_script("install", "agent", "run", "--profile", manifest.profile),
+                manifest.base_env,
             )
         )
         records.extend(
@@ -91,6 +111,7 @@ def render_runner_scripts(manifest: DeploymentManifest) -> list[ArtifactRecord]:
                 windows_ensure_script_path(manifest.profile),
                 windows_ensure_cmd_path(manifest.profile),
                 _command_for_script("install", "agent", "ensure", "--profile", manifest.profile),
+                manifest.base_env,
             )
         )
         return records
@@ -99,10 +120,12 @@ def render_runner_scripts(manifest: DeploymentManifest) -> list[ArtifactRecord]:
         _render_unix_runner(
             unix_run_script_path(manifest.profile),
             _command_for_script("install", "agent", "run", "--profile", manifest.profile),
+            manifest.base_env,
         ),
         _render_unix_runner(
             unix_ensure_script_path(manifest.profile),
             _command_for_script("install", "agent", "ensure", "--profile", manifest.profile),
+            manifest.base_env,
         ),
     ]
 

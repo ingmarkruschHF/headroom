@@ -124,6 +124,7 @@ def build_manifest(
     intercept_tool_results: bool = False,
     protect_tool_results: str | None = None,
     bedrock_profile: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> DeploymentManifest:
     """Create a normalized deployment manifest."""
 
@@ -153,6 +154,10 @@ def build_manifest(
     base_env["HEADROOM_TELEMETRY"] = "on" if telemetry_enabled else "off"
     if memory_enabled:
         base_env["HEADROOM_MEMORY_ENABLED"] = "1"
+    # Applied last so explicit --env overrides win over the auto-derived
+    # defaults above (e.g. a custom HEADROOM_WORKSPACE_DIR).
+    if extra_env:
+        base_env.update(extra_env)
 
     proxy_args = [
         "--host",

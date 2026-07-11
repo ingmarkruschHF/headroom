@@ -22,7 +22,11 @@ from headroom.install.supervisors import (
 
 
 def _manifest(
-    *, profile: str = "default", scope: str = "user", supervisor: str = "service"
+    *,
+    profile: str = "default",
+    scope: str = "user",
+    supervisor: str = "service",
+    base_env: dict[str, str] | None = None,
 ) -> DeploymentManifest:
     return DeploymentManifest(
         profile=profile,
@@ -36,6 +40,7 @@ def _manifest(
         host="127.0.0.1",
         backend="anthropic",
         service_name=f"headroom-{profile}",
+        base_env=base_env or {},
     )
 
 
@@ -72,6 +77,31 @@ def test_command_for_script_and_unix_runner(monkeypatch, tmp_path: Path) -> None
     content = Path(record.path).read_text(encoding="utf-8")
     assert content.startswith("#!/usr/bin/env bash")
     assert "exec headroom run --flag" in content
+
+
+def test_render_unix_runner_exports_env_before_exec(tmp_path: Path) -> None:
+    record = _render_unix_runner(
+        tmp_path / "run-headroom.sh",
+        ["headroom", "run"],
+        {"HEADROOM_WORKSPACE_DIR": "/Users/x/.headroom-workspace", "AWS_PROFILE": "sso-bedrock"},
+    )
+
+    content = Path(record.path).read_text(encoding="utf-8")
+    export_index = content.index("export HEADROOM_WORKSPACE_DIR=")
+    exec_index = content.index("exec headroom run")
+
+    assert "export HEADROOM_WORKSPACE_DIR=/Users/x/.headroom-workspace" in content
+    assert "export AWS_PROFILE=sso-bedrock" in content
+    assert export_index < exec_index
+
+
+def test_render_unix_runner_omits_export_block_without_env(tmp_path: Path) -> None:
+    record = _render_unix_runner(tmp_path / "run-headroom.sh", ["headroom", "run"])
+
+    content = Path(record.path).read_text(encoding="utf-8")
+
+    assert "export" not in content
+    assert content == "#!/usr/bin/env bash\nset -euo pipefail\nexec headroom run\n"
 
 
 def test_linux_task_spec_for_user_scope_includes_crontab_markers(tmp_path: Path) -> None:
@@ -142,6 +172,23 @@ def test_render_runner_scripts_writes_unix_scripts(monkeypatch, tmp_path: Path) 
         "run-headroom.sh",
         "ensure-headroom.sh",
     }
+
+
+def test_render_runner_scripts_threads_base_env_into_both_scripts(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    monkeypatch.setattr(
+        "headroom.install.supervisors.resolve_headroom_command", lambda: ["headroom"]
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _manifest(base_env={"HEADROOM_WORKSPACE_DIR": "/custom/workspace"})
+
+    records = render_runner_scripts(manifest)
+
+    for record in records:
+        content = Path(record.path).read_text(encoding="utf-8")
+        assert "export HEADROOM_WORKSPACE_DIR=/custom/workspace" in content
 
 
 def test_render_runner_scripts_writes_windows_scripts(monkeypatch, tmp_path: Path) -> None:
