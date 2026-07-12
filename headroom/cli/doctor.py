@@ -24,7 +24,7 @@ import click
 
 from headroom._version import format_version_label, normalize_release_version
 from headroom.install.health import probe_json
-from headroom.install.lifecycle import remove_deployment, start_deployment
+from headroom.install.lifecycle import remove_deployment, restore_deployment, start_deployment
 from headroom.install.models import (
     ConfigScope,
     DeploymentManifest,
@@ -474,11 +474,41 @@ def _manifest_drift(
     return drift
 
 
-def _bootstrap_default_manifest(target: DeploymentManifest) -> None:
-    target.mutations = apply_mutations(target)
-    target.artifacts = install_supervisor(target)
-    save_manifest(target)
-    start_deployment(target)
+def _bootstrap_default_manifest(
+    target: DeploymentManifest, *, previous: DeploymentManifest | None = None
+) -> None:
+    """Apply and start the canonical 'default' manifest, rolling back on failure.
+
+    Mirrors the rollback `install_apply` already does: a failed bootstrap must
+    not leave the deployment half-broken (mutations applied but never started,
+    or the previous working config torn down with nothing to replace it),
+    since that is exactly the failure class `doctor --fix` exists to recover
+    from.
+    """
+    try:
+        target.mutations = apply_mutations(target)
+        target.artifacts = install_supervisor(target)
+        save_manifest(target)
+        start_deployment(target)
+    except Exception as exc:
+        remove_deployment(target)
+        if previous is None:
+            raise click.ClickException(
+                f"Failed to bootstrap deployment 'default': {exc}"
+            ) from exc
+        try:
+            restore_deployment(previous)
+        except Exception as restore_exc:
+            raise click.ClickException(
+                f"Failed to reconcile deployment 'default': {exc}. Restoring the "
+                f"previous config also failed: {restore_exc}. The deployment may "
+                "be left without a running proxy; run `headroom install apply` "
+                "manually to recover."
+            ) from exc
+        raise click.ClickException(
+            f"Failed to reconcile deployment 'default': {exc}. Restored the "
+            "previous working config."
+        ) from exc
 
 
 def reconcile_deployments(
@@ -523,7 +553,7 @@ def reconcile_deployments(
                     actions.append(f"would reconcile '{manifest.profile}' config drift ({changed})")
                 else:
                     remove_deployment(manifest)
-                    _bootstrap_default_manifest(target)
+                    _bootstrap_default_manifest(target, previous=manifest)
                     actions.append(f"reconciled '{manifest.profile}' config drift ({changed})")
                 continue
 

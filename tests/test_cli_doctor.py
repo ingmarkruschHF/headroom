@@ -6,6 +6,7 @@ import dataclasses
 import json
 from dataclasses import dataclass
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -420,6 +421,77 @@ class TestReconcileDeployments:
         result = reconcile_deployments([matching], probe=lambda url: {"ready": True}, fix=True)
         assert result is not None and result.status == PASS
         assert "healthy" in result.summary
+
+    def test_fix_bootstrap_from_nothing_failure_raises_with_no_rollback_attempt(
+        self, monkeypatch
+    ):
+        removed: list[str] = []
+        monkeypatch.setattr(doctor_mod, "apply_mutations", lambda manifest: [])
+        monkeypatch.setattr(doctor_mod, "install_supervisor", lambda manifest: [])
+        monkeypatch.setattr(doctor_mod, "save_manifest", lambda manifest: None)
+        monkeypatch.setattr(
+            doctor_mod,
+            "start_deployment",
+            lambda manifest: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        monkeypatch.setattr(
+            doctor_mod, "remove_deployment", lambda manifest: removed.append(manifest.profile)
+        )
+        monkeypatch.setattr(
+            doctor_mod,
+            "restore_deployment",
+            lambda manifest: pytest.fail("nothing to restore when bootstrapping from scratch"),
+        )
+
+        with pytest.raises(click.ClickException, match="Failed to bootstrap"):
+            reconcile_deployments([], fix=True)
+        assert removed == ["default"]
+
+    def test_fix_reconcile_failure_restores_previous_manifest(self, monkeypatch):
+        removed: list[str] = []
+        restored: list[str] = []
+        monkeypatch.setattr(
+            doctor_mod, "remove_deployment", lambda manifest: removed.append(manifest.profile)
+        )
+        monkeypatch.setattr(doctor_mod, "apply_mutations", lambda manifest: [])
+        monkeypatch.setattr(doctor_mod, "install_supervisor", lambda manifest: [])
+        monkeypatch.setattr(doctor_mod, "save_manifest", lambda manifest: None)
+        monkeypatch.setattr(
+            doctor_mod,
+            "start_deployment",
+            lambda manifest: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        monkeypatch.setattr(
+            doctor_mod, "restore_deployment", lambda manifest: restored.append(manifest.profile)
+        )
+        drifted = dataclasses.replace(doctor_mod._build_canonical_default_manifest(), port=9999)
+
+        with pytest.raises(click.ClickException, match="Restored the previous working config"):
+            reconcile_deployments([drifted], fix=True)
+        # Once to tear down the drifted manifest, once more to clean up the
+        # failed bootstrap attempt inside _bootstrap_default_manifest.
+        assert removed == ["default", "default"]
+        assert restored == ["default"]
+
+    def test_fix_reconcile_failure_when_restore_also_fails(self, monkeypatch):
+        monkeypatch.setattr(doctor_mod, "remove_deployment", lambda manifest: None)
+        monkeypatch.setattr(doctor_mod, "apply_mutations", lambda manifest: [])
+        monkeypatch.setattr(doctor_mod, "install_supervisor", lambda manifest: [])
+        monkeypatch.setattr(doctor_mod, "save_manifest", lambda manifest: None)
+        monkeypatch.setattr(
+            doctor_mod,
+            "start_deployment",
+            lambda manifest: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        monkeypatch.setattr(
+            doctor_mod,
+            "restore_deployment",
+            lambda manifest: (_ for _ in ()).throw(RuntimeError("restore also failed")),
+        )
+        drifted = dataclasses.replace(doctor_mod._build_canonical_default_manifest(), port=9999)
+
+        with pytest.raises(click.ClickException, match="Restoring the previous config also failed"):
+            reconcile_deployments([drifted], fix=True)
 
 
 class TestDoctorCommand:
