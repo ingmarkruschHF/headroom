@@ -18,10 +18,9 @@ from headroom.install.models import (
     InstallPreset,
     ProviderSelectionMode,
     RuntimeKind,
-    SupervisorKind,
 )
 from headroom.install.planner import build_manifest
-from headroom.install.providers import apply_mutations, revert_mutations
+from headroom.install.providers import apply_mutations
 from headroom.install.runtime import (
     acquire_runtime_start_lock,
     run_foreground,
@@ -31,15 +30,10 @@ from headroom.install.runtime import (
 )
 from headroom.install.state import (
     ManifestError,
-    delete_manifest,
     load_manifest,
     save_manifest,
 )
-from headroom.install.supervisors import (
-    install_supervisor,
-    remove_supervisor,
-    stop_supervisor,
-)
+from headroom.install.supervisors import install_supervisor
 
 from .main import main
 
@@ -345,21 +339,7 @@ def install_remove(profile: str) -> None:
     """Remove a persistent deployment and undo managed config."""
 
     manifest = _require_manifest(profile)
-    try:
-        if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-            stop_supervisor(manifest)
-    except Exception:
-        pass
-    try:
-        stop_runtime(manifest)
-    except Exception:
-        pass
-    try:
-        remove_supervisor(manifest)
-    except Exception:
-        pass
-    revert_mutations(manifest)
-    delete_manifest(profile)
+    remove_deployment(manifest)
     click.echo(f"Removed deployment '{profile}'.")
 
 
