@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-import shutil
-import subprocess
-from copy import deepcopy
-
 import click
 
 from headroom.install.health import probe_json, probe_ready
+from headroom.install.lifecycle import (
+    reject_task_lifecycle,
+    remove_deployment,
+    restore_deployment,
+    start_deployment,
+    stop_deployment,
+)
 from headroom.install.models import (
     ConfigScope,
     DeploymentManifest,
@@ -23,8 +26,6 @@ from headroom.install.runtime import (
     acquire_runtime_start_lock,
     run_foreground,
     runtime_status,
-    start_detached_agent,
-    start_persistent_docker,
     stop_runtime,
     wait_ready,
 )
@@ -37,7 +38,6 @@ from headroom.install.state import (
 from headroom.install.supervisors import (
     install_supervisor,
     remove_supervisor,
-    start_supervisor,
     stop_supervisor,
 )
 
@@ -57,86 +57,6 @@ def _require_manifest(profile: str) -> DeploymentManifest:
     if manifest is None:
         raise click.ClickException(f"No deployment profile named '{profile}' is installed.")
     return manifest
-
-
-def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool = False) -> None:
-    if not assume_start_lock:
-        with acquire_runtime_start_lock(manifest.profile) as acquired:
-            if not acquired:
-                click.echo(f"Deployment '{manifest.profile}' start is already in progress.")
-                return
-            _start_deployment(manifest, assume_start_lock=True)
-            return
-
-    if probe_ready(manifest.health_url):
-        return
-    if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value and shutil.which("docker") is None:
-        raise click.ClickException(
-            "Docker is required for this deployment but 'docker' was not found on PATH."
-        )
-    if runtime_status(manifest) == "running":
-        if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
-            return
-        stop_runtime(manifest)
-
-    try:
-        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
-            start_persistent_docker(manifest)
-        elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-            start_supervisor(manifest)
-        else:
-            start_detached_agent(manifest.profile)
-    except FileNotFoundError as e:
-        # A required external binary (docker, launchctl, systemctl) is missing.
-        raise click.ClickException(f"Cannot start deployment '{manifest.profile}': {e}") from None
-    except subprocess.CalledProcessError as e:
-        raise click.ClickException(
-            f"Cannot start deployment '{manifest.profile}': command failed "
-            f"({' '.join(map(str, e.cmd)) if isinstance(e.cmd, list | tuple) else e.cmd})"
-        ) from None
-
-    if not wait_ready(manifest, timeout_seconds=45):
-        raise click.ClickException(
-            f"Deployment '{manifest.profile}' did not become ready after start."
-        )
-
-
-def _stop_deployment(manifest: DeploymentManifest) -> None:
-    if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        stop_supervisor(manifest)
-    stop_runtime(manifest)
-
-
-def _remove_deployment(manifest: DeploymentManifest) -> None:
-    try:
-        _stop_deployment(manifest)
-    except Exception:
-        pass
-    try:
-        remove_supervisor(manifest)
-    except Exception:
-        pass
-    try:
-        revert_mutations(manifest)
-    except Exception:
-        pass
-    delete_manifest(manifest.profile)
-
-
-def _restore_deployment(manifest: DeploymentManifest) -> None:
-    restored = deepcopy(manifest)
-    restored.mutations = apply_mutations(restored)
-    restored.artifacts = install_supervisor(restored)
-    save_manifest(restored)
-    _start_deployment(restored)
-
-
-def _reject_task_lifecycle(manifest: DeploymentManifest, action: str) -> None:
-    if manifest.supervisor_kind == SupervisorKind.TASK.value:
-        raise click.ClickException(
-            f"Deployment '{manifest.profile}' uses persistent-task scheduling; "
-            f"`headroom install {action}` is not supported for task deployments."
-        )
 
 
 @install.command("apply")
@@ -338,18 +258,18 @@ def install_apply(
         existing = None
     if existing is not None:
         click.echo(f"Updating existing deployment profile '{profile}'...")
-        _remove_deployment(existing)
+        remove_deployment(existing)
 
     try:
         manifest.mutations = apply_mutations(manifest)
         manifest.artifacts = install_supervisor(manifest)
         save_manifest(manifest)
-        _start_deployment(manifest)
+        start_deployment(manifest)
     except Exception as exc:
-        _remove_deployment(manifest)
+        remove_deployment(manifest)
         if existing is not None:
             click.echo(f"Restoring previous deployment '{profile}'...")
-            _restore_deployment(existing)
+            restore_deployment(existing)
         # Surface non-Click errors (OSError, CalledProcessError, …) as a clean
         # message rather than a raw traceback; Click errors pass through as-is.
         if isinstance(exc, click.ClickException | click.Abort):
@@ -391,8 +311,8 @@ def install_start(profile: str) -> None:
     """Start a persistent deployment."""
 
     manifest = _require_manifest(profile)
-    _reject_task_lifecycle(manifest, "start")
-    _start_deployment(manifest)
+    reject_task_lifecycle(manifest, "start")
+    start_deployment(manifest)
     click.echo(f"Started deployment '{profile}'.")
 
 
@@ -402,8 +322,8 @@ def install_stop(profile: str) -> None:
     """Stop a persistent deployment."""
 
     manifest = _require_manifest(profile)
-    _reject_task_lifecycle(manifest, "stop")
-    _stop_deployment(manifest)
+    reject_task_lifecycle(manifest, "stop")
+    stop_deployment(manifest)
     click.echo(f"Stopped deployment '{profile}'.")
 
 
@@ -413,9 +333,9 @@ def install_restart(profile: str) -> None:
     """Restart a persistent deployment."""
 
     manifest = _require_manifest(profile)
-    _reject_task_lifecycle(manifest, "restart")
-    _stop_deployment(manifest)
-    _start_deployment(manifest)
+    reject_task_lifecycle(manifest, "restart")
+    stop_deployment(manifest)
+    start_deployment(manifest)
     click.echo(f"Restarted deployment '{profile}'.")
 
 
@@ -485,5 +405,5 @@ def install_agent_ensure(profile: str) -> None:
                 click.echo(f"Deployment '{profile}' is healthy.")
                 return
             stop_runtime(manifest)
-        _start_deployment(manifest, assume_start_lock=True)
+        start_deployment(manifest, assume_start_lock=True)
     click.echo(f"Deployment '{profile}' is healthy.")
