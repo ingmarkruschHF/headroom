@@ -310,6 +310,13 @@ def test_install_supervisor_linux_service_and_tasks(monkeypatch, tmp_path: Path)
     assert "@reboot ensure" in calls[-1][1]["input"]
 
 
+class _LaunchctlResult:
+    def __init__(self, returncode: int = 0, stderr: str = "", stdout: str = "") -> None:
+        self.returncode = returncode
+        self.stderr = stderr
+        self.stdout = stdout
+
+
 def test_install_supervisor_darwin_windows_and_unsupported(monkeypatch, tmp_path: Path) -> None:
     run_script = tmp_path / "run-headroom.sh"
     ensure_script = tmp_path / "ensure-headroom.sh"
@@ -323,7 +330,7 @@ def test_install_supervisor_darwin_windows_and_unsupported(monkeypatch, tmp_path
     calls: list[list[str]] = []
     monkeypatch.setattr(
         "headroom.install.supervisors.subprocess.run",
-        lambda command, **kwargs: calls.append(command),
+        lambda command, **kwargs: (calls.append(command), _LaunchctlResult(0))[1],
     )
     monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 123, raising=False)
 
@@ -382,11 +389,72 @@ def test_install_supervisor_darwin_windows_and_unsupported(monkeypatch, tmp_path
         install_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
 
 
-class _LaunchctlResult:
-    def __init__(self, returncode: int = 0, stderr: str = "", stdout: str = "") -> None:
-        self.returncode = returncode
-        self.stderr = stderr
-        self.stdout = stdout
+def test_install_supervisor_retries_bootstrap_until_launchd_settles(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # Same EIO-after-bootout race start_supervisor already rides out, but hit
+    # via install_supervisor's own bootout+bootstrap sequence on every apply.
+    run_script = tmp_path / "run-headroom.sh"
+    monkeypatch.setattr(
+        "headroom.install.supervisors.render_runner_scripts",
+        lambda manifest: [
+            type("Record", (), {"kind": "script", "path": run_script.as_posix()})(),
+        ],
+    )
+    plist_path = tmp_path / "com.headroom.default.plist"
+    monkeypatch.setattr(
+        "headroom.install.supervisors._macos_launchd_plist",
+        lambda manifest, script, interval=None: (plist_path, "plist"),
+    )
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
+    monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 123, raising=False)
+    monkeypatch.setattr("headroom.install.supervisors.time.sleep", lambda _s: None)
+    bootstrap_attempts = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal bootstrap_attempts
+        if command[1] == "bootout":
+            return _LaunchctlResult(0)
+        bootstrap_attempts += 1
+        if bootstrap_attempts < 3:
+            return _LaunchctlResult(5, stderr="Bootstrap failed: 5: Input/output error")
+        return _LaunchctlResult(0)
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    install_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+    assert bootstrap_attempts == 3
+
+
+def test_install_supervisor_raises_after_bootstrap_keeps_failing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    run_script = tmp_path / "run-headroom.sh"
+    monkeypatch.setattr(
+        "headroom.install.supervisors.render_runner_scripts",
+        lambda manifest: [
+            type("Record", (), {"kind": "script", "path": run_script.as_posix()})(),
+        ],
+    )
+    plist_path = tmp_path / "com.headroom.default.plist"
+    monkeypatch.setattr(
+        "headroom.install.supervisors._macos_launchd_plist",
+        lambda manifest, script, interval=None: (plist_path, "plist"),
+    )
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
+    monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 123, raising=False)
+    monkeypatch.setattr("headroom.install.supervisors.time.sleep", lambda _s: None)
+    monkeypatch.setattr("headroom.install.supervisors._MACOS_BOOTSTRAP_RETRIES", 3)
+
+    def fake_run(command, **kwargs):
+        if command[1] == "bootout":
+            return _LaunchctlResult(0)
+        return _LaunchctlResult(5, stderr="Bootstrap failed: 5: Input/output error")
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    with pytest.raises(click.ClickException, match="could not bootstrap"):
+        install_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
 
 
 def test_start_and_stop_supervisor_darwin_windows_and_none(monkeypatch) -> None:
