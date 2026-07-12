@@ -523,7 +523,9 @@ def reconcile_deployments(
     the `default` profile specifically, reconcile config drift against
     `_CANONICAL_DEFAULT_PROFILE` — bootstrapping it from nothing if it's
     missing entirely, or removing and reinstalling it if its live config has
-    drifted. `dry_run` previews these actions instead of taking them.
+    drifted. `dry_run` previews these actions instead of taking them, at the
+    same severity `headroom doctor` (no flags) would report for the same
+    manifests — a preview must not read as less urgent than the real check.
     """
     active = fix or dry_run
     if not active:
@@ -544,6 +546,7 @@ def reconcile_deployments(
         )
 
     actions: list[str] = []
+    any_down = False
     for manifest in manifests:
         if manifest.profile == "default":
             drift = _manifest_drift(manifest, target)
@@ -561,22 +564,32 @@ def reconcile_deployments(
         ready = bool(payload and (payload.get("ready") or payload.get("status") == "healthy"))
         if ready:
             continue
+        any_down = True
         if dry_run:
             actions.append(f"would restart '{manifest.profile}'")
         else:
             start_deployment(manifest)
             actions.append(f"restarted '{manifest.profile}'")
 
-    if actions:
+    if not actions:
         return CheckResult(
             name="deployments",
-            status=WARN if dry_run else PASS,
-            summary=f"{len(manifests)} deployment(s) checked — {'; '.join(actions)}",
+            status=PASS,
+            summary=f"{len(manifests)} deployment(s) healthy",
         )
+    if dry_run:
+        # A preview must report at least as severe as the real check would —
+        # config drift on an otherwise-healthy deployment is at least WARN
+        # (something differs from what --fix would do), but a genuinely down
+        # deployment must still surface as FAIL, not be silently demoted to
+        # WARN just because --dry-run took no action.
+        status = FAIL if any_down else WARN
+    else:
+        status = PASS
     return CheckResult(
         name="deployments",
-        status=PASS,
-        summary=f"{len(manifests)} deployment(s) healthy",
+        status=status,
+        summary=f"{len(manifests)} deployment(s) checked — {'; '.join(actions)}",
     )
 
 

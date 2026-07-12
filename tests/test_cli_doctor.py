@@ -343,7 +343,11 @@ class TestReconcileDeployments:
         manifests = [_FakeManifest("prod", "http://127.0.0.1:9999/readyz")]
         result = reconcile_deployments(manifests, probe=lambda url: None, dry_run=True)
         assert started == []
-        assert result is not None and result.status == WARN
+        # A genuinely down deployment stays FAIL under --dry-run, matching
+        # what plain `headroom doctor` would report for it — the preview must
+        # not read as less severe than the real check would be.
+        assert result is not None and result.status == FAIL
+        assert "would restart 'prod'" in result.summary
         assert "would restart 'prod'" in result.summary
 
     def test_fix_bootstraps_missing_default_profile(self, monkeypatch):
@@ -405,6 +409,21 @@ class TestReconcileDeployments:
         assert removed == []
         assert result is not None and result.status == WARN
         assert "would reconcile 'default' config drift" in result.summary
+
+    def test_dry_run_previews_down_deployment_alongside_drift_as_fail(self, monkeypatch):
+        removed: list[str] = []
+        monkeypatch.setattr(
+            doctor_mod, "remove_deployment", lambda manifest: removed.append(manifest.profile)
+        )
+        drifted = dataclasses.replace(doctor_mod._build_canonical_default_manifest(), port=9999)
+        down = _FakeManifest("prod", "http://127.0.0.1:9999/readyz")
+        result = reconcile_deployments([drifted, down], probe=lambda url: None, dry_run=True)
+        assert removed == []
+        # A down deployment among the batch must dominate the drift-only WARN
+        # — the preview must never read less severe than plain `doctor` would.
+        assert result is not None and result.status == FAIL
+        assert "would reconcile 'default' config drift" in result.summary
+        assert "would restart 'prod'" in result.summary
 
     def test_fix_leaves_matching_healthy_default_untouched(self, monkeypatch):
         monkeypatch.setattr(
