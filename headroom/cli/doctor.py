@@ -24,8 +24,19 @@ import click
 
 from headroom._version import format_version_label, normalize_release_version
 from headroom.install.health import probe_json
+from headroom.install.lifecycle import remove_deployment, start_deployment
+from headroom.install.models import (
+    ConfigScope,
+    DeploymentManifest,
+    InstallPreset,
+    ProviderSelectionMode,
+    RuntimeKind,
+)
 from headroom.install.paths import claude_settings_path, codex_config_path
-from headroom.install.state import list_manifests
+from headroom.install.planner import build_manifest
+from headroom.install.providers import apply_mutations
+from headroom.install.state import list_manifests, save_manifest
+from headroom.install.supervisors import install_supervisor
 from headroom.paths import savings_path
 from headroom.providers.claude import (
     REMOTE_CONTROL_BASE_URL_ENV,
@@ -401,6 +412,144 @@ def check_deployments(manifests: list[Any], probe: Any = probe_json) -> CheckRes
     )
 
 
+# This engineer's single-profile deployment: the canonical config the launchd
+# service is meant to run. `headroom doctor --fix` compares against this and
+# self-heals `default` specifically; other profiles are restart-only, since
+# this fork has no basis for guessing what they're supposed to look like.
+_CANONICAL_DEFAULT_PROFILE = {
+    "profile": "default",
+    "preset": InstallPreset.PERSISTENT_SERVICE.value,
+    "runtime_kind": RuntimeKind.PYTHON.value,
+    "scope": ConfigScope.USER.value,
+    "provider_mode": ProviderSelectionMode.MANUAL.value,
+    "targets": [],
+    "port": 8787,
+    "backend": "bedrock",
+    "anyllm_provider": None,
+    "region": "eu-west-1",
+    "proxy_mode": "token",
+    "memory_enabled": False,
+    "telemetry_enabled": False,
+    "image": "ghcr.io/chopratejas/headroom:latest",
+    "code_aware": True,
+    "intercept_tool_results": False,
+    "protect_tool_results": "Bash",
+    "bedrock_profile": "sso-bedrock",
+    "extra_env": {
+        "HEADROOM_WORKSPACE_DIR": str(Path.home() / ".headroom-workspace"),
+        "AWS_PROFILE": "sso-bedrock",
+        "AWS_REGION": "eu-west-1",
+    },
+}
+
+# Fields that fully determine runtime behavior; anything else (timestamps,
+# derived paths, mutation/artifact bookkeeping) is not part of the diff.
+_DRIFT_FIELDS = (
+    "preset",
+    "runtime_kind",
+    "supervisor_kind",
+    "scope",
+    "backend",
+    "port",
+    "region",
+    "proxy_args",
+    "base_env",
+)
+
+
+def _build_canonical_default_manifest() -> DeploymentManifest:
+    return build_manifest(**_CANONICAL_DEFAULT_PROFILE)
+
+
+def _manifest_drift(
+    existing: DeploymentManifest, target: DeploymentManifest
+) -> dict[str, tuple[Any, Any]]:
+    """Field-by-field diff between a live and a target manifest."""
+    drift = {}
+    for field_name in _DRIFT_FIELDS:
+        old = getattr(existing, field_name)
+        new = getattr(target, field_name)
+        if old != new:
+            drift[field_name] = (old, new)
+    return drift
+
+
+def _bootstrap_default_manifest(target: DeploymentManifest) -> None:
+    target.mutations = apply_mutations(target)
+    target.artifacts = install_supervisor(target)
+    save_manifest(target)
+    start_deployment(target)
+
+
+def reconcile_deployments(
+    manifests: list[Any],
+    *,
+    probe: Any = probe_json,
+    fix: bool = False,
+    dry_run: bool = False,
+) -> CheckResult | None:
+    """Report-only unless `fix` or `dry_run` is set (then behaves exactly like
+    `check_deployments`). Otherwise: restart any unhealthy deployment, and for
+    the `default` profile specifically, reconcile config drift against
+    `_CANONICAL_DEFAULT_PROFILE` — bootstrapping it from nothing if it's
+    missing entirely, or removing and reinstalling it if its live config has
+    drifted. `dry_run` previews these actions instead of taking them.
+    """
+    active = fix or dry_run
+    if not active:
+        return check_deployments(manifests, probe=probe)
+
+    target = _build_canonical_default_manifest()
+    has_default = any(m.profile == "default" for m in manifests)
+    if not manifests and not has_default:
+        if dry_run:
+            actions = ["would bootstrap 'default' from nothing"]
+        else:
+            _bootstrap_default_manifest(target)
+            actions = ["bootstrapped 'default' from nothing"]
+        return CheckResult(
+            name="deployments",
+            status=WARN if dry_run else PASS,
+            summary=f"1 deployment(s) checked — {'; '.join(actions)}",
+        )
+
+    actions: list[str] = []
+    for manifest in manifests:
+        if manifest.profile == "default":
+            drift = _manifest_drift(manifest, target)
+            if drift:
+                changed = ", ".join(sorted(drift))
+                if dry_run:
+                    actions.append(f"would reconcile '{manifest.profile}' config drift ({changed})")
+                else:
+                    remove_deployment(manifest)
+                    _bootstrap_default_manifest(target)
+                    actions.append(f"reconciled '{manifest.profile}' config drift ({changed})")
+                continue
+
+        payload = probe(manifest.health_url)
+        ready = bool(payload and (payload.get("ready") or payload.get("status") == "healthy"))
+        if ready:
+            continue
+        if dry_run:
+            actions.append(f"would restart '{manifest.profile}'")
+        else:
+            start_deployment(manifest)
+            actions.append(f"restarted '{manifest.profile}'")
+
+    if actions:
+        return CheckResult(
+            name="deployments",
+            status=WARN if dry_run else PASS,
+            summary=f"{len(manifests)} deployment(s) checked — {'; '.join(actions)}",
+        )
+    return CheckResult(
+        name="deployments",
+        status=PASS,
+        summary=f"{len(manifests)} deployment(s) healthy",
+    )
+
+
 _STATUS_STYLE = {PASS: "green", WARN: "yellow", FAIL: "red", SKIP: "dim"}
 _STATUS_GLYPH = {PASS: "✓", WARN: "⚠", FAIL: "✗", SKIP: "·"}
 
@@ -449,7 +598,21 @@ def _render(checks: list[CheckResult], port: int, installed: str) -> None:
     help="Proxy port to check (default: 8787, env: HEADROOM_PORT)",
 )
 @click.option("--json", "emit_json", is_flag=True, help="Emit JSON instead of formatted output.")
-def doctor(port: int, emit_json: bool) -> None:
+@click.option(
+    "--fix",
+    is_flag=True,
+    help=(
+        "Self-heal the deployments check: restart any unhealthy deployment, and "
+        "bootstrap/reconcile the 'default' profile against its canonical config. "
+        "Every other check stays report-only."
+    ),
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="With --fix, report what would change without taking action.",
+)
+def doctor(port: int, emit_json: bool, fix: bool, dry_run: bool) -> None:
     """Check that the Headroom proxy and client routing are working.
 
     \b
@@ -476,7 +639,7 @@ def doctor(port: int, emit_json: bool) -> None:
     remote_control_gate_check = check_claude_remote_control_gate(claude_settings_path(), os.environ)
     if remote_control_gate_check is not None:
         checks.append(remote_control_gate_check)
-    deployments = check_deployments(list_manifests())
+    deployments = reconcile_deployments(list_manifests(), fix=fix, dry_run=dry_run)
     if deployments is not None:
         checks.append(deployments)
 

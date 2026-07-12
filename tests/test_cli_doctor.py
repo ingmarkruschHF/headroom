@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 
@@ -23,6 +24,7 @@ from headroom.cli.doctor import (
     check_savings,
     check_shell_env,
     check_version_drift,
+    reconcile_deployments,
 )
 from headroom.cli.main import main
 from headroom.providers.claude.runtime import remote_control_gate_message
@@ -312,6 +314,114 @@ class TestDeployments:
         assert "prod" in result.summary
 
 
+class TestReconcileDeployments:
+    """`reconcile_deployments` powers `headroom doctor [--fix] [--dry-run]`."""
+
+    def test_without_fix_or_dry_run_matches_check_deployments(self):
+        manifests = [_FakeManifest("prod", "http://127.0.0.1:9999/readyz")]
+        result = reconcile_deployments(manifests, probe=lambda url: None)
+        assert result is not None and result.status == FAIL
+        assert "prod" in result.summary
+
+    def test_fix_restarts_unhealthy_non_default_profile(self, monkeypatch):
+        started: list[str] = []
+        monkeypatch.setattr(
+            doctor_mod, "start_deployment", lambda manifest: started.append(manifest.profile)
+        )
+        manifests = [_FakeManifest("prod", "http://127.0.0.1:9999/readyz")]
+        result = reconcile_deployments(manifests, probe=lambda url: None, fix=True)
+        assert started == ["prod"]
+        assert result is not None and result.status == PASS
+        assert "restarted 'prod'" in result.summary
+
+    def test_dry_run_previews_restart_without_acting(self, monkeypatch):
+        started: list[str] = []
+        monkeypatch.setattr(
+            doctor_mod, "start_deployment", lambda manifest: started.append(manifest.profile)
+        )
+        manifests = [_FakeManifest("prod", "http://127.0.0.1:9999/readyz")]
+        result = reconcile_deployments(manifests, probe=lambda url: None, dry_run=True)
+        assert started == []
+        assert result is not None and result.status == WARN
+        assert "would restart 'prod'" in result.summary
+
+    def test_fix_bootstraps_missing_default_profile(self, monkeypatch):
+        bootstrapped: list[str] = []
+        monkeypatch.setattr(doctor_mod, "apply_mutations", lambda manifest: [])
+        monkeypatch.setattr(doctor_mod, "install_supervisor", lambda manifest: [])
+        monkeypatch.setattr(doctor_mod, "save_manifest", lambda manifest: None)
+        monkeypatch.setattr(
+            doctor_mod,
+            "start_deployment",
+            lambda manifest: bootstrapped.append(manifest.profile),
+        )
+        result = reconcile_deployments([], fix=True)
+        assert bootstrapped == ["default"]
+        assert result is not None and result.status == PASS
+        assert "bootstrapped 'default'" in result.summary
+
+    def test_dry_run_previews_missing_default_bootstrap(self, monkeypatch):
+        bootstrapped: list[str] = []
+        monkeypatch.setattr(
+            doctor_mod,
+            "start_deployment",
+            lambda manifest: bootstrapped.append(manifest.profile),
+        )
+        result = reconcile_deployments([], dry_run=True)
+        assert bootstrapped == []
+        assert result is not None and result.status == WARN
+        assert "would bootstrap 'default'" in result.summary
+
+    def test_fix_reconciles_drifted_default_profile(self, monkeypatch):
+        removed: list[str] = []
+        bootstrapped: list[str] = []
+        monkeypatch.setattr(
+            doctor_mod, "remove_deployment", lambda manifest: removed.append(manifest.profile)
+        )
+        monkeypatch.setattr(doctor_mod, "apply_mutations", lambda manifest: [])
+        monkeypatch.setattr(doctor_mod, "install_supervisor", lambda manifest: [])
+        monkeypatch.setattr(doctor_mod, "save_manifest", lambda manifest: None)
+        monkeypatch.setattr(
+            doctor_mod,
+            "start_deployment",
+            lambda manifest: bootstrapped.append(manifest.profile),
+        )
+        drifted = dataclasses.replace(doctor_mod._build_canonical_default_manifest(), port=9999)
+        result = reconcile_deployments([drifted], fix=True)
+        assert removed == ["default"]
+        assert bootstrapped == ["default"]
+        assert result is not None and result.status == PASS
+        assert "reconciled 'default' config drift" in result.summary
+        assert "port" in result.summary
+
+    def test_dry_run_previews_default_drift_without_acting(self, monkeypatch):
+        removed: list[str] = []
+        monkeypatch.setattr(
+            doctor_mod, "remove_deployment", lambda manifest: removed.append(manifest.profile)
+        )
+        drifted = dataclasses.replace(doctor_mod._build_canonical_default_manifest(), port=9999)
+        result = reconcile_deployments([drifted], dry_run=True)
+        assert removed == []
+        assert result is not None and result.status == WARN
+        assert "would reconcile 'default' config drift" in result.summary
+
+    def test_fix_leaves_matching_healthy_default_untouched(self, monkeypatch):
+        monkeypatch.setattr(
+            doctor_mod,
+            "start_deployment",
+            lambda manifest: pytest.fail("should not restart a healthy matching deployment"),
+        )
+        monkeypatch.setattr(
+            doctor_mod,
+            "remove_deployment",
+            lambda manifest: pytest.fail("should not reinstall a matching deployment"),
+        )
+        matching = doctor_mod._build_canonical_default_manifest()
+        result = reconcile_deployments([matching], probe=lambda url: {"ready": True}, fix=True)
+        assert result is not None and result.status == PASS
+        assert "healthy" in result.summary
+
+
 class TestDoctorCommand:
     @pytest.fixture
     def runner(self):
@@ -397,6 +507,35 @@ class TestDoctorCommand:
         monkeypatch.setattr(doctor_mod, "probe_json", recording_probe)
         runner.invoke(main, ["doctor"], env={"HEADROOM_PORT": "9999"})
         assert "http://127.0.0.1:9999/livez" in seen
+
+    def test_fix_bootstraps_missing_default_deployment(self, runner, isolated, monkeypatch):
+        monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
+        monkeypatch.setattr(doctor_mod, "get_version", lambda: "0.26.0")
+        bootstrapped: list[str] = []
+        monkeypatch.setattr(doctor_mod, "apply_mutations", lambda manifest: [])
+        monkeypatch.setattr(doctor_mod, "install_supervisor", lambda manifest: [])
+        monkeypatch.setattr(doctor_mod, "save_manifest", lambda manifest: None)
+        monkeypatch.setattr(
+            doctor_mod,
+            "start_deployment",
+            lambda manifest: bootstrapped.append(manifest.profile),
+        )
+        result = runner.invoke(main, ["doctor", "--fix"])
+        assert bootstrapped == ["default"]
+        assert "bootstrapped 'default'" in result.output
+
+    def test_dry_run_does_not_bootstrap(self, runner, isolated, monkeypatch):
+        monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
+        monkeypatch.setattr(doctor_mod, "get_version", lambda: "0.26.0")
+        bootstrapped: list[str] = []
+        monkeypatch.setattr(
+            doctor_mod,
+            "start_deployment",
+            lambda manifest: bootstrapped.append(manifest.profile),
+        )
+        result = runner.invoke(main, ["doctor", "--dry-run"])
+        assert bootstrapped == []
+        assert "would bootstrap 'default'" in result.output
 
 
 class TestCostTrackerBudgetKeys:
