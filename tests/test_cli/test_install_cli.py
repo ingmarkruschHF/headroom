@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+
 import click
 from click.testing import CliRunner
 
@@ -31,20 +33,22 @@ def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
         "headroom.cli.install.save_manifest", lambda deployment: calls.append("save")
     )
     monkeypatch.setattr(
-        "headroom.cli.install.start_supervisor", lambda deployment: calls.append("start_service")
+        "headroom.install.lifecycle.start_supervisor",
+        lambda deployment: calls.append("start_service"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.start_detached_agent", lambda profile: calls.append("start_agent")
+        "headroom.install.lifecycle.start_detached_agent",
+        lambda profile: calls.append("start_agent"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.start_persistent_docker",
+        "headroom.install.lifecycle.start_persistent_docker",
         lambda deployment: calls.append("start_docker"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+        "headroom.install.lifecycle.wait_ready", lambda deployment, timeout_seconds=45: True
     )
-    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
-    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
+    monkeypatch.setattr("headroom.install.lifecycle.probe_ready", lambda url, timeout=2.0: False)
+    monkeypatch.setattr("headroom.install.lifecycle.runtime_status", lambda manifest: "stopped")
 
     result = runner.invoke(main, ["install", "apply"])
 
@@ -80,10 +84,10 @@ def test_install_apply_forwards_no_http2_to_build_manifest(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
     monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
-    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
-    monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
+    monkeypatch.setattr("headroom.install.lifecycle.start_supervisor", lambda deployment: None)
+    monkeypatch.setattr("headroom.install.lifecycle.start_detached_agent", lambda profile: None)
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+        "headroom.install.lifecycle.wait_ready", lambda deployment, timeout_seconds=45: True
     )
 
     result = runner.invoke(main, ["install", "apply", "--no-http2"])
@@ -144,19 +148,21 @@ def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
     monkeypatch.setattr(
-        "headroom.cli.install.stop_supervisor", lambda manifest: calls.append("stop_supervisor")
+        "headroom.install.lifecycle.stop_supervisor",
+        lambda manifest: calls.append("stop_supervisor"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.stop_runtime", lambda manifest: calls.append("stop_runtime")
+        "headroom.install.lifecycle.stop_runtime", lambda manifest: calls.append("stop_runtime")
     )
     monkeypatch.setattr(
-        "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
+        "headroom.install.lifecycle.start_supervisor",
+        lambda manifest: calls.append("start_supervisor"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda manifest, timeout_seconds=45: True
+        "headroom.install.lifecycle.wait_ready", lambda manifest, timeout_seconds=45: True
     )
-    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
-    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
+    monkeypatch.setattr("headroom.install.lifecycle.probe_ready", lambda url, timeout=2.0: False)
+    monkeypatch.setattr("headroom.install.lifecycle.runtime_status", lambda manifest: "stopped")
 
     result = runner.invoke(main, ["install", "restart"])
 
@@ -178,9 +184,10 @@ def test_install_start_noops_when_already_healthy(monkeypatch) -> None:
         health_url = "http://127.0.0.1:8787/readyz"
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
-    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
+    monkeypatch.setattr("headroom.install.lifecycle.probe_ready", lambda url, timeout=2.0: True)
     monkeypatch.setattr(
-        "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
+        "headroom.install.lifecycle.start_supervisor",
+        lambda manifest: calls.append("start_supervisor"),
     )
 
     result = runner.invoke(main, ["install", "start"])
@@ -202,8 +209,10 @@ def test_install_start_noops_for_healthy_docker_without_docker_on_path(monkeypat
         health_url = "http://127.0.0.1:8787/readyz"
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
-    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
-    monkeypatch.setattr("headroom.cli.install.shutil.which", lambda name, *args, **kwargs: None)
+    monkeypatch.setattr("headroom.install.lifecycle.probe_ready", lambda url, timeout=2.0: True)
+    monkeypatch.setattr(
+        "headroom.install.lifecycle.shutil.which", lambda name, *args, **kwargs: None
+    )
 
     result = runner.invoke(main, ["install", "start"])
 
@@ -225,15 +234,14 @@ def test_install_start_does_not_spawn_when_start_lock_is_contended(monkeypatch) 
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
 
-    import contextlib
-
     @contextlib.contextmanager
     def fake_lock(profile):
         yield False
 
-    monkeypatch.setattr("headroom.cli.install.acquire_runtime_start_lock", fake_lock)
+    monkeypatch.setattr("headroom.install.lifecycle.acquire_runtime_start_lock", fake_lock)
     monkeypatch.setattr(
-        "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
+        "headroom.install.lifecycle.start_supervisor",
+        lambda manifest: calls.append("start_supervisor"),
     )
 
     result = runner.invoke(main, ["install", "start"])
@@ -256,15 +264,19 @@ def test_install_start_restarts_wedged_runtime_under_single_lock(monkeypatch) ->
         health_url = "http://127.0.0.1:8787/readyz"
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
-    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
-    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
+    monkeypatch.setattr("headroom.install.lifecycle.probe_ready", lambda url, timeout=2.0: False)
+    monkeypatch.setattr("headroom.install.lifecycle.runtime_status", lambda manifest: "running")
     wait_results = iter([False, True])
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda manifest, timeout_seconds: next(wait_results)
+        "headroom.install.lifecycle.wait_ready",
+        lambda manifest, timeout_seconds: next(wait_results),
     )
-    monkeypatch.setattr("headroom.cli.install.stop_runtime", lambda manifest: calls.append("stop"))
     monkeypatch.setattr(
-        "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
+        "headroom.install.lifecycle.stop_runtime", lambda manifest: calls.append("stop")
+    )
+    monkeypatch.setattr(
+        "headroom.install.lifecycle.start_supervisor",
+        lambda manifest: calls.append("start_supervisor"),
     )
 
     result = runner.invoke(main, ["install", "start"])
@@ -320,10 +332,10 @@ def test_install_apply_accepts_opencode_target(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
     monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
-    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
-    monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
+    monkeypatch.setattr("headroom.install.lifecycle.start_supervisor", lambda deployment: None)
+    monkeypatch.setattr("headroom.install.lifecycle.start_detached_agent", lambda profile: None)
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+        "headroom.install.lifecycle.wait_ready", lambda deployment, timeout_seconds=45: True
     )
 
     result = runner.invoke(
@@ -379,32 +391,46 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
         lambda deployment: calls.append(f"save:{','.join(deployment.targets)}"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.stop_supervisor",
+        "headroom.install.lifecycle.stop_supervisor",
         lambda deployment: calls.append(f"stop-supervisor:{','.join(deployment.targets)}"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.stop_runtime",
+        "headroom.install.lifecycle.stop_runtime",
         lambda deployment: calls.append(f"stop-runtime:{','.join(deployment.targets)}"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.remove_supervisor",
+        "headroom.install.lifecycle.remove_supervisor",
         lambda deployment: calls.append(f"remove-supervisor:{','.join(deployment.targets)}"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.revert_mutations",
+        "headroom.install.lifecycle.revert_mutations",
         lambda deployment: calls.append(f"revert:{','.join(deployment.targets)}"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.delete_manifest",
+        "headroom.install.lifecycle.delete_manifest",
         lambda profile: calls.append(f"delete:{profile}"),
     )
+    monkeypatch.setattr(
+        "headroom.install.lifecycle.apply_mutations",
+        lambda deployment: calls.append(f"apply:{','.join(deployment.targets)}") or [],
+    )
+    monkeypatch.setattr(
+        "headroom.install.lifecycle.install_supervisor",
+        lambda deployment: calls.append(f"supervisor:{','.join(deployment.targets)}") or [],
+    )
+    monkeypatch.setattr(
+        "headroom.install.lifecycle.save_manifest",
+        lambda deployment: calls.append(f"save:{','.join(deployment.targets)}"),
+    )
 
-    def _start(deployment) -> None:
+    def _start(deployment, **kwargs) -> None:
         calls.append(f"start:{','.join(deployment.targets)}")
         if deployment is new_manifest:
             raise click.ClickException("boom")
 
-    monkeypatch.setattr("headroom.cli.install._start_deployment", _start)
+    monkeypatch.setattr("headroom.install.lifecycle.start_supervisor", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_deployment", _start)
+    monkeypatch.setattr("headroom.install.lifecycle.start_deployment", _start)
 
     result = runner.invoke(main, ["install", "apply"])
 
@@ -473,21 +499,21 @@ def test_install_apply_uses_docker_runtime_for_persistent_docker(monkeypatch) ->
     monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr(
-        "headroom.cli.install.start_persistent_docker",
+        "headroom.install.lifecycle.start_persistent_docker",
         lambda deployment: calls.append("start_docker"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+        "headroom.install.lifecycle.wait_ready", lambda deployment, timeout_seconds=45: True
     )
-    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
-    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda deployment: "stopped")
-    # _start_deployment guards the persistent-docker preset with
+    monkeypatch.setattr("headroom.install.lifecycle.probe_ready", lambda url, timeout=2.0: False)
+    monkeypatch.setattr("headroom.install.lifecycle.runtime_status", lambda deployment: "stopped")
+    # start_deployment guards the persistent-docker preset with
     # `shutil.which("docker")`. Fake docker as present so the test exercises the
     # runtime-selection path itself rather than the host's docker install —
     # otherwise it passes on dev machines with Docker but fails on CI runners
     # (e.g. macos-latest) that have no docker on PATH.
     monkeypatch.setattr(
-        "headroom.cli.install.shutil.which",
+        "headroom.install.lifecycle.shutil.which",
         lambda name, *args, **kwargs: "/usr/local/bin/docker" if name == "docker" else None,
     )
 
@@ -510,22 +536,21 @@ def test_install_remove_continues_when_runtime_teardown_errors(monkeypatch) -> N
         health_url = "http://127.0.0.1:8787/readyz"
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+
+    def raise_error(manifest):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("headroom.install.lifecycle.stop_supervisor", raise_error)
+    monkeypatch.setattr("headroom.install.lifecycle.stop_runtime", raise_error)
     monkeypatch.setattr(
-        "headroom.cli.install.stop_supervisor",
-        lambda manifest: (_ for _ in ()).throw(RuntimeError("boom")),
+        "headroom.install.lifecycle.remove_supervisor",
+        lambda manifest: calls.append("remove_supervisor"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.stop_runtime",
-        lambda manifest: (_ for _ in ()).throw(RuntimeError("boom")),
+        "headroom.install.lifecycle.revert_mutations", lambda manifest: calls.append("revert")
     )
     monkeypatch.setattr(
-        "headroom.cli.install.remove_supervisor", lambda manifest: calls.append("remove_supervisor")
-    )
-    monkeypatch.setattr(
-        "headroom.cli.install.revert_mutations", lambda manifest: calls.append("revert")
-    )
-    monkeypatch.setattr(
-        "headroom.cli.install.delete_manifest", lambda profile: calls.append("delete")
+        "headroom.install.lifecycle.delete_manifest", lambda profile: calls.append("delete")
     )
 
     result = runner.invoke(main, ["install", "remove"])
@@ -577,20 +602,14 @@ def test_install_agent_ensure_no_spawn_when_lock_not_acquired(monkeypatch) -> No
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
 
-    import contextlib
-
     @contextlib.contextmanager
     def fake_lock(profile):
         yield False
 
     monkeypatch.setattr("headroom.cli.install.acquire_runtime_start_lock", fake_lock)
     monkeypatch.setattr(
-        "headroom.cli.install.start_detached_agent",
-        lambda profile: calls.append("start_agent"),
-    )
-    monkeypatch.setattr(
-        "headroom.cli.install.start_persistent_docker",
-        lambda manifest: calls.append("start_docker"),
+        "headroom.cli.install.start_deployment",
+        lambda manifest, **kwargs: calls.append("start_deployment"),
     )
 
     result = runner.invoke(main, ["install", "agent", "ensure"])
@@ -613,18 +632,12 @@ def test_install_agent_ensure_stops_wedged_runtime_before_restart(monkeypatch) -
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
-    monkeypatch.setattr("headroom.cli.install.wait_ready", lambda manifest, timeout_seconds: False)
-    monkeypatch.setattr("headroom.cli.install.stop_runtime", lambda manifest: calls.append("stop"))
     monkeypatch.setattr(
-        "headroom.cli.install.start_detached_agent",
-        lambda profile: calls.append("start_agent"),
+        "headroom.cli.install.wait_ready", lambda manifest, timeout_seconds: False
     )
     monkeypatch.setattr(
-        "headroom.cli.install.start_persistent_docker",
-        lambda manifest: calls.append("start_docker"),
+        "headroom.cli.install.stop_runtime", lambda manifest: calls.append("stop")
     )
-
-    import contextlib
 
     @contextlib.contextmanager
     def fake_lock(profile):
@@ -632,20 +645,17 @@ def test_install_agent_ensure_stops_wedged_runtime_before_restart(monkeypatch) -
 
     monkeypatch.setattr("headroom.cli.install.acquire_runtime_start_lock", fake_lock)
     monkeypatch.setattr(
-        "headroom.cli.install._start_deployment",
+        "headroom.cli.install.start_deployment",
         lambda manifest, **kwargs: calls.append("start_deployment"),
     )
 
     result = runner.invoke(main, ["install", "agent", "ensure"])
     assert result.exit_code == 0, result.output
-    # stop must come before start_deployment — that's the bug guard.
+    # stop before start_deployment — that's the bug guard.
     assert calls.index("stop") < calls.index("start_deployment")
-    assert "start_agent" not in calls
-    assert "start_docker" not in calls
 
 
 def test_install_agent_ensure_starts_when_stopped_and_lock_acquired(monkeypatch) -> None:
-    """Ensure starts a runtime when none is running and lock is acquired."""
     runner = CliRunner()
     calls: list[str] = []
 
@@ -658,31 +668,24 @@ def test_install_agent_ensure_starts_when_stopped_and_lock_acquired(monkeypatch)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
-    monkeypatch.setattr(
-        "headroom.cli.install.start_detached_agent",
-        lambda profile: calls.append("start_agent"),
-    )
-    monkeypatch.setattr(
-        "headroom.cli.install.start_persistent_docker",
-        lambda manifest: calls.append("start_docker"),
-    )
-
-    import contextlib
 
     @contextlib.contextmanager
     def fake_lock(profile):
         yield True
 
     monkeypatch.setattr("headroom.cli.install.acquire_runtime_start_lock", fake_lock)
-    monkeypatch.setattr("headroom.cli.install.wait_ready", lambda manifest, timeout_seconds: True)
+    monkeypatch.setattr(
+        "headroom.cli.install.start_deployment",
+        lambda manifest, **kwargs: calls.append("start_deployment"),
+    )
 
     result = runner.invoke(main, ["install", "agent", "ensure"])
     assert result.exit_code == 0, result.output
-    assert calls == ["start_agent"]
+    assert calls == ["start_deployment"]
 
 
 def test_install_agent_ensure_no_duplicate_spawn_after_lock_recheck(monkeypatch) -> None:
-    """Ensure does not spawn if proxy becomes ready between initial probe and lock."""
+    """Ensure does not spawn if the proxy becomes ready between the initial probe and the lock."""
     runner = CliRunner()
     calls: list[str] = []
 
@@ -696,11 +699,9 @@ def test_install_agent_ensure_no_duplicate_spawn_after_lock_recheck(monkeypatch)
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: next(probe_results))
 
     monkeypatch.setattr(
-        "headroom.cli.install.start_detached_agent",
+        "headroom.install.lifecycle.start_detached_agent",
         lambda profile: calls.append("start_agent"),
     )
-
-    import contextlib
 
     @contextlib.contextmanager
     def fake_lock(profile):
@@ -715,12 +716,12 @@ def test_install_agent_ensure_no_duplicate_spawn_after_lock_recheck(monkeypatch)
 
 
 def test_install_agent_ensure_propagates_start_deployment_failure(monkeypatch) -> None:
-    """Ensure must exit non-zero and surface the error when _start_deployment fails.
+    """Ensure must exit non-zero and surface the error when start_deployment fails.
 
     Regression for review feedback on PR #1301: the previous implementation wrapped
-    the guarded block in `except Exception` and returned normally, which made
-    a failed ensure indistinguishable from a successful one. Automation callers
-    need a non-zero exit code to detect that the deployment did not come up.
+    the guarded block in `except Exception` and returned normally, which made a
+    failed ensure indistinguishable from a successful one. Automation callers
+    need a non-zero exit code to detect the deployment did not come up.
     """
     runner = CliRunner()
 
@@ -734,8 +735,6 @@ def test_install_agent_ensure_propagates_start_deployment_failure(monkeypatch) -
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
 
-    import contextlib
-
     @contextlib.contextmanager
     def fake_lock(profile):
         yield True
@@ -745,7 +744,7 @@ def test_install_agent_ensure_propagates_start_deployment_failure(monkeypatch) -
     def boom(manifest, **kwargs):
         raise click.ClickException("simulated start failure")
 
-    monkeypatch.setattr("headroom.cli.install._start_deployment", boom)
+    monkeypatch.setattr("headroom.cli.install.start_deployment", boom)
 
     result = runner.invoke(main, ["install", "agent", "ensure"])
     assert result.exit_code != 0, f"expected non-zero exit, got {result.exit_code}: {result.output}"
